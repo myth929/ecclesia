@@ -17,4 +17,18 @@ function M.debug(...)
     print(unpack(formated_args))
 end
 
+function M.with_cwd(cwd, fn, ...)
+    local curcwd = vim.fn.getcwd()
+    if curcwd == cwd then
+        return fn(...)
+    else
+        local mods = { noautocmd = true }
+        vim.cmd.cd({ cwd, mods = mods })
+        local ok, result = pcall(fn, ...)
+        vim.cmd.cd({ curcwd, mods = mods })
+        if ok then return result end
+        error(result)
+    end
+end
+
 return M
