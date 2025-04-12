@@ -1,16 +1,7 @@
 local Utils = require("ecclesia.utils")
-local uv = vim.loop
-local api = vim.api
+local uv = vim.uv
 
 local M = {}
-
-local function eval_fn_or_id(x)
-    if type(x) == "function" then
-        return x()
-    else
-        return x
-    end
-end
 
 M.linters_map = {
     javascript = { "eslint_d" },
@@ -18,70 +9,55 @@ M.linters_map = {
 }
 
 function M.linters(key)
-    -- Utils.debug("ecclesia.linters." .. key)
     local ok, linter = pcall(require, "ecclesia.linters." .. key)
     if ok then return linter end
     return nil
 end
 
-local namespaces = setmetatable({}, {
-    __index = function(tbl, key)
-        local ns = api.nvim_create_namespace(key)
-        rawset(tbl, key, ns)
-        return ns
-    end,
-})
+local function read_output(cwd, parser, publish_fn)
+    return function(err, chunk)
+        Utils.debug(Utils.debug(chunk), chunk)
+        assert(not err, err)
+        if chunk then
+            parser.on_chunk(chunk)
+        else
+            parser.on_done(publish_fn, cwd)
+        end
+    end
+end
 
-function M.run_lint(linter, opts)
-    assert(linter, "lint must be called with a linter")
+function M.run_lint(linter)
     local stdin = assert(uv.new_pipe(false), "Must be able to create pipe")
     local stdout = assert(uv.new_pipe(false), "Must be able to create pipe")
     local stderr = assert(uv.new_pipe(false), "Must be able to create pipe")
     local handle
-    local env
     local pid_or_err
     local args = {}
-    local bufnr = api.nvim_get_current_buf()
-    opts = opts or {}
-    local cwd = opts.cwd or linter.cwd or vim.fn.getcwd()
+    local opts = {}
+    local cwd = linter.cwd or vim.fn.getcwd()
 
-    local function eval(...) return Utils.with_cwd(cwd, eval_fn_or_id, ...) end
+    local function eval(...) return Utils.with_cwd(cwd, ...) end
 
-    if linter.args then vim.list_extend(args, vim.tbl_map(eval, linter.args)) end
-    if not linter.stdin and linter.append_fname ~= false then table.insert(args, api.nvim_buf_get_name(bufnr)) end
-    if linter.env then
-        env = {}
-        if not linter.env["PATH"] then
-            -- Always include PATH as we need it to execute the linter command
-            table.insert(env, "PATH=" .. os.getenv("PATH"))
-        end
-        for k, v in pairs(linter.env) do
-            table.insert(env, k .. "=" .. v)
-        end
-    end
+    vim.list_extend(args, vim.tbl_map(eval, linter.args))
+
     local linter_opts = {
         args = args,
         stdio = { stdin, stdout, stderr },
-        env = env,
         cwd = cwd,
+        detached = true
     }
+
     local cmd = eval(linter.cmd)
-    assert(cmd, "Linter definition must have a `cmd` set: " .. vim.inspect(linter))
+
     handle, pid_or_err = uv.spawn(cmd, linter_opts, function(code)
-        if handle and not handle:is_closing() then
-            local procs = {}
-            -- Only cleanup if there has not been another procs in between
-            local proc = procs[linter.name] or {}
-            if handle == proc.handle then procs[linter.name] = nil end
-            handle:close()
-        end
-        if code ~= 0 and not linter.ignore_exitcode then
-            vim.schedule(
-                function() vim.notify("Linter command `" .. cmd .. "` exited with code: " .. code, vim.log.levels.WARN) end
-            )
-        end
+        Utils.debug("进程退出码:", code)
     end)
-    if not handle then
+
+    if handle then
+        Utils.debug(pid_or_err)
+        Utils.debug(cmd, linter_opts)
+    else
+        Utils.debug("子进程启动失败！")
         stdout:close()
         stderr:close()
         stdin:close()
@@ -90,29 +66,55 @@ function M.run_lint(linter, opts)
         end
         return nil
     end
-    local state = {
-        bufnr = bufnr,
-        stdout = stdout,
-        stderr = stderr,
-        handle = handle,
-        linter = linter,
-        cwd = linter_opts.cwd,
-        ns = namespaces[linter.name],
-        cancelled = false,
-    }
-    local linter_proc = setmetatable(state, {})
-    Utils.printTable(linter_proc)
+
+    local timer = uv.new_timer()
+    timer:start(20000, 0, function()
+        if handle and not handle:is_closing() then
+            handle:kill("sigkill")
+            Utils.debug("超时强制终止进程")
+        end
+        timer:close()
+    end)
+
+    local parser = Utils.accumulate_chunks(linter.parser)
+
+    local publish = function(diagnostics)
+        Utils.debug(type(diagnostics), diagnostics)
+    end
+
+    local stream = linter.stream
+
+    if not stream or stream == 'stdout' then
+        stdout:read_start(function(err, chunk)
+            Utils.debug(err)
+            xpcall(function()
+                assert(not err, err)
+                if chunk then
+                    parser.on_chunk(chunk)
+                else
+                    parser.on_done(publish, cwd)
+                end
+            end, function(e)
+                print("回调出错:", e)
+            end)
+        end)
+    elseif stream == 'stderr' then
+        stderr:read_start(read_output(cwd, parser, publish))
+    else
+        error('Invalid `stream` setting: ' .. stream)
+    end
+
     return {}
 end
 
-function M.lint()
+function M.init_lint()
     local names = M.linters_map[vim.bo.filetype]
-    local opts = {}
+
+    if not names then return end
 
     local lookup_linter = function(name)
         local linter = M.linters(name)
         assert(linter, "Linter with name `" .. name .. "` not available")
-        if type(linter) == "function" then linter = linter() end
         linter.name = linter.name or name
         return linter
     end
@@ -120,29 +122,19 @@ function M.lint()
     for _, linter_name in pairs(names) do
         local linter = lookup_linter(linter_name)
 
-        local ok, lintproc_or_error = pcall(M.run_lint, linter, opts)
-        -- Utils.debug(opts)
-        if ok then
-            -- Utils.debug("lint start")
-        else
-            -- Utils.debug(lintproc_or_error)
-        end
+        local ok, lintproc_or_error = pcall(M.run_lint, linter)
     end
 end
 
 -- init plugin
-function M.setup()
-    if vim.fn.has("nvim-0.10") == 1 then
-        local async, message = vim.uv.new_async(function()
-            vim.schedule(function() vim.notify("run success !!!", vim.log.levels.INFO, {}) end)
-        end)
-        if async then
-            async:send()
-        else
-            -- Utils.debug(string.format("err,%s", message))
-        end
-    else
-        -- Utils.debug("The version of neovim needs to be at least 0.10!! you can use branch legacy")
+function M.setup(opts)
+    if opts.run_lint then
+        vim.keymap.set(
+            "n",
+            opts.run_lint,
+            function() M.init_lint() end,
+            { desc = "Trigger linting for current file" }
+        )
     end
 end
 
