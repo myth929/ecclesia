@@ -41,18 +41,12 @@ end
 
 function M.accumulate_chunks(parse)
     local chunks = {}
-    local parse_failure_msg = [[Parser failed. Error message:
-%s
-
-Output from linter:
-%s
-]]
+    local parse_failure_msg = [[Parser failed. Error message: %s; Output from linter: %s]]
     return {
         on_chunk = function(chunk)
             table.insert(chunks, chunk)
         end,
         on_done = function(publish, linter_cwd)
-            -- M.debug("chunks", linter_cwd)
             vim.schedule(function()
                 local output = table.concat(chunks)
                 if output ~= "" then

@@ -16,7 +16,6 @@ end
 
 local function read_output(cwd, parser, publish_fn)
     return function(err, chunk)
-        Utils.debug(Utils.debug(chunk), chunk)
         assert(not err, err)
         if chunk then
             parser.on_chunk(chunk)
@@ -49,15 +48,20 @@ function M.run_lint(linter)
 
     local cmd = eval(linter.cmd)
 
+    -- 启动进程
     handle, pid_or_err = uv.spawn(cmd, linter_opts, function(code)
-        Utils.debug("进程退出码:", code)
+        if handle and not handle:is_closing() then
+            handle:close()
+        end
+        if code ~= 0 and not linter.ignore_exitcode then
+            vim.schedule(function()
+                vim.notify('Linter command `' .. cmd .. '` exited with code: ' .. code, vim.log.levels.WARN)
+            end)
+        end
     end)
 
-    if handle then
-        Utils.debug(pid_or_err)
-        Utils.debug(cmd, linter_opts)
-    else
-        Utils.debug("子进程启动失败！")
+    -- 失败
+    if not handle then
         stdout:close()
         stderr:close()
         stdin:close()
@@ -67,39 +71,28 @@ function M.run_lint(linter)
         return nil
     end
 
+    -- 超时强制终止进程
     local timer = uv.new_timer()
     timer:start(20000, 0, function()
         if handle and not handle:is_closing() then
             handle:kill("sigkill")
-            Utils.debug("超时强制终止进程")
         end
         timer:close()
     end)
 
     local parser = Utils.accumulate_chunks(linter.parser)
 
-    local publish = function(diagnostics)
+    -- 获取ai建议
+    local suggestion = function(diagnostics)
         Utils.debug(type(diagnostics), diagnostics)
     end
 
     local stream = linter.stream
 
     if not stream or stream == 'stdout' then
-        stdout:read_start(function(err, chunk)
-            Utils.debug(err)
-            xpcall(function()
-                assert(not err, err)
-                if chunk then
-                    parser.on_chunk(chunk)
-                else
-                    parser.on_done(publish, cwd)
-                end
-            end, function(e)
-                print("回调出错:", e)
-            end)
-        end)
+        stdout:read_start(read_output(cwd, parser, suggestion))
     elseif stream == 'stderr' then
-        stderr:read_start(read_output(cwd, parser, publish))
+        stderr:read_start(read_output(cwd, parser, function() end))
     else
         error('Invalid `stream` setting: ' .. stream)
     end
@@ -128,7 +121,7 @@ end
 
 -- init plugin
 function M.setup(opts)
-    if opts.run_lint then
+    if opts and opts.run_lint then
         vim.keymap.set(
             "n",
             opts.run_lint,
